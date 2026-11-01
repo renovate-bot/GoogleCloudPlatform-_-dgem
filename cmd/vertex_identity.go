@@ -19,6 +19,8 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+
+	"github.com/GoogleCloudPlatform/dgem/pkg/client"
 )
 
 // vertexIdentity is the endpoint a Vertex URL actually reaches: the host the request (and the gateway's access token)
@@ -29,6 +31,7 @@ type vertexIdentity struct {
 	Location   string // region from the path
 	EndpointID string
 	Dedicated  bool // <ID>.<REGION>-<PROJECT_NUMBER>.prediction.vertexai.goog
+	Private    bool // <ID>-<REGION>-<PROJECT_NUMBER>.prediction.p.vertexai.goog (PSC)
 	ProjectNum string
 }
 
@@ -50,6 +53,7 @@ var (
 //
 //	https://<ID>.<REGION>-<PROJECT_NUMBER>.prediction.vertexai.goog/v1/projects/<P>/locations/<REGION>/endpoints/<ID>/invoke/...
 //	https://<REGION>-aiplatform.googleapis.com/v1/projects/<P>/locations/<REGION>/endpoints/<ID>:rawPredict (or :predict, :streamRawPredict, /invoke/...)
+//	http(s)://<ID>-<REGION>-<PROJECT_NUMBER>.prediction.p.vertexai.goog/v1/projects/<P>/locations/<REGION>/endpoints/<ID>:rawPredict (private / PSC)
 //
 // Query strings, fragments, user info, non-443 ports, escaped or dot path segments are rejected, and on a dedicated
 // host the endpoint ID, region and (numeric) project in the path must agree with the host name. It never falls back
@@ -60,14 +64,22 @@ func parseVertexEndpointIdentity(raw string) (vertexIdentity, error) {
 	if err != nil {
 		return id, fmt.Errorf("not a URL")
 	}
-	if u.Scheme != "https" {
-		return id, fmt.Errorf("scheme must be https")
+	private := client.IsPrivateVertexHost(u.Hostname())
+	switch {
+	case u.Scheme == "https":
+		if p := u.Port(); p != "" && p != "443" {
+			return id, fmt.Errorf("port %s is not allowed", p)
+		}
+	case u.Scheme == "http" && private:
+		// PSC endpoints serve a self-signed certificate on 443; inside the VPC they are called over http on port 80.
+		if p := u.Port(); p != "" && p != "80" {
+			return id, fmt.Errorf("port %s is not allowed", p)
+		}
+	default:
+		return id, fmt.Errorf("scheme must be https (http only for a private endpoint)")
 	}
 	if u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.Opaque != "" {
 		return id, fmt.Errorf("user info, query strings and fragments are not allowed")
-	}
-	if p := u.Port(); p != "" && p != "443" {
-		return id, fmt.Errorf("port %s is not allowed", p)
 	}
 	if u.RawPath != "" || strings.Contains(u.EscapedPath(), "%") {
 		return id, fmt.Errorf("escaped path characters are not allowed")
@@ -110,6 +122,21 @@ func parseVertexEndpointIdentity(raw string) (vertexIdentity, error) {
 	id.Host = host
 
 	switch {
+	case private:
+		// <ID>-<REGION>-<PROJECT_NUMBER>.prediction.p.vertexai.goog; PSC endpoints have only the :rawPredict/:predict route.
+		label := strings.TrimSuffix(host, client.PrivateVertexHostSuffix)
+		prefix := strings.ToLower(id.EndpointID) + "-" + id.Location + "-"
+		if strings.Contains(label, ".") || !strings.HasPrefix(label, prefix) || !vertexNumberRe.MatchString(label[len(prefix):]) {
+			return id, fmt.Errorf("private endpoint host must be <id>-<region>-<project_number>%s matching the path", client.PrivateVertexHostSuffix)
+		}
+		hostProjNum := label[len(prefix):]
+		if vertexNumberRe.MatchString(id.Project) && id.Project != hostProjNum {
+			return id, fmt.Errorf("project number in the path does not match the host")
+		}
+		if method == "" || method == ":streamRawPredict" {
+			return id, fmt.Errorf("private endpoints accept only :rawPredict or :predict")
+		}
+		id.Private, id.ProjectNum = true, hostProjNum
 	case strings.HasSuffix(host, dedicatedVertexSuffix):
 		// <ID>.<REGION>-<PROJECT_NUMBER>.prediction.vertexai.goog
 		labels := strings.Split(strings.TrimSuffix(host, dedicatedVertexSuffix), ".")
@@ -160,12 +187,15 @@ func (v vertexIdentity) projectKey() string {
 }
 
 // sameVertexEndpoint reports whether two identities reach the same endpoint: same project, region and endpoint ID,
-// and, for dedicated endpoints, the same host (the dedicated host receives the gateway's token directly).
+// and, for dedicated and private endpoints, the same host (that host receives the gateway's token directly).
 func sameVertexEndpoint(a, b vertexIdentity) bool {
 	if a.EndpointID != b.EndpointID || a.Location != b.Location || a.projectKey() != b.projectKey() {
 		return false
 	}
-	if a.Dedicated && b.Dedicated {
+	if a.Private != b.Private {
+		return false // the private (PSC) and public routes of an endpoint are different targets
+	}
+	if (a.Dedicated && b.Dedicated) || a.Private {
 		return a.Host == b.Host
 	}
 	return true

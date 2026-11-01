@@ -81,7 +81,7 @@ def access_token():
 
 
 def bearer(url, audience=None):
-    if "prediction.vertexai.goog" in url:
+    if cd.net.is_vertex(url):  # public dedicated, private PSC (*.prediction.p.vertexai.goog) or aiplatform API
         return access_token()
     base = url.split("/", 3)
     return id_token(audience or (base[0] + "//" + base[2]))
@@ -101,7 +101,7 @@ class ProbeTarget(cd.Target):
 def probe_serving(name, base, n):
     t = ProbeTarget(name, base)
     failures = []
-    st, raw = t.request("/health", None, method="GET")
+    st, raw, _ = t.request("/health", None, method="GET")
     version = ""
     try:
         h = json.loads(raw)
@@ -123,7 +123,7 @@ def probe_serving(name, base, n):
             failures.append(f"{case}: no answers")
     walls, denoise = [], []
     schema = {"instructions": "Triage the ticket.", "samples": 1, "think": 0, "questions": ss.Q}
-    url = base.rstrip("/") + "/v1/chat/completions"
+    url = cd.net.route(base, "/v1/chat/completions")[0]  # a Vertex :rawPredict base is its own single route
     for i in range(n):
         payload = {"model": "dgemma", "messages": [{"role": "system", "content": json.dumps(schema)},
                                                    {"role": "user", "content": json.dumps({"ticket": ss.TICKETS[i % len(ss.TICKETS)]})}]}

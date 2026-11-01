@@ -124,3 +124,36 @@ func decideUpstreamStatus(err error) int {
 	}
 	return http.StatusBadGateway
 }
+
+// systemOneRawUsers lists callers (dgem.user) whose /v1/systemone requests are forwarded to the serving image unchanged
+// when it can answer them as sent (decisionindex.FitsServingImage); "*" means every caller. Set with
+// --systemone-raw-users / DGEM_SYSTEMONE_RAW_USERS.
+var systemOneRawUsers []string
+
+func systemOneRawCaller(user string) bool {
+	for _, u := range systemOneRawUsers {
+		if u == "*" || (user != "" && strings.EqualFold(u, user)) {
+			return true
+		}
+	}
+	return false
+}
+
+// systemOneForwardBody is the body forwarded on the pass-through path: the caller's bytes unchanged, except that
+// "media" entries (already merged into req.Images) are replaced by "images", which is what the serving image reads.
+func systemOneForwardBody(body []byte, req decisionindex.SystemOneRequest) ([]byte, error) {
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(body, &top); err != nil {
+		return nil, err
+	}
+	if _, ok := top["media"]; !ok {
+		return body, nil
+	}
+	delete(top, "media")
+	imgs, err := json.Marshal(req.Images)
+	if err != nil {
+		return nil, err
+	}
+	top["images"] = imgs
+	return json.Marshal(top)
+}

@@ -17,6 +17,7 @@
 FROM python:3.12-slim
 WORKDIR /app
 COPY scripts/probe.py scripts/contract_diff.py scripts/serving_speed.py /app/scripts/
+COPY scripts/matrix/ /app/scripts/matrix/
 COPY fixtures/bbox/ /app/fixtures/bbox/
 ENV PYTHONUNBUFFERED=1
 ENTRYPOINT ["python3", "/app/scripts/probe.py"]

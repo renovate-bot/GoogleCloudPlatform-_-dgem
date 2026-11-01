@@ -24,12 +24,14 @@
 # Required:
 #   GCP_PROJECT            hosting project
 #   PROBE_VERTEX_URL       Vertex dedicated invoke base: https://<ID>.<REGION>-<NUM>.prediction.vertexai.goog/v1/projects/<P>/locations/<R>/endpoints/<ID>/invoke
+#                          or a private (PSC) :rawPredict URL (then also set PROBE_NETWORK)
 #   PROBE_GATEWAY_URL      gateway run.app URL (https://dgemma-gateway-<hash>-uc.a.run.app), not an IAP custom domain
 #   PROBE_CLOUDRUN_URL     serving Cloud Run URL (https://dgemma-<hash>-uc.a.run.app)
 # Optional:
 #   GCP_REGION (us-central1)  HOURLY_SCHEDULE ("7 * * * *")  DAILY_SCHEDULE ("17 6 * * *")  SCHEDULE_TZ (Etc/UTC)
 #   GATEWAY_SERVICE (dgemma-gateway)  CLOUDRUN_SERVICE (dgemma)  PROBE_SA_NAME (dgem-probe-sa)
 #   PROBE_LATENCY_REQUESTS (20)  PROBE_DAILY=off (skip the Cloud Run job)
+#   PROBE_NETWORK / PROBE_SUBNET  Direct VPC egress for the hourly job (needed for a private PSC Vertex URL)
 #   PROBE_GATEWAY_AUDIENCE  required when the gateway has IAP enabled: one of its programmatic OAuth clients
 #                           (gcloud iap settings get --resource-type=cloud-run --service=<gateway> --region=<r>)
 set -euo pipefail
@@ -73,6 +75,8 @@ echo "==> Building ${IMAGE}"
 CTX="$(mktemp -d)"; trap 'rm -rf "${CTX}"' EXIT
 mkdir -p "${CTX}/scripts" "${CTX}/fixtures"
 cp "${REPO_ROOT}"/scripts/{probe.py,contract_diff.py,serving_speed.py} "${CTX}/scripts/"
+cp -R "${REPO_ROOT}/scripts/matrix" "${CTX}/scripts/"  # contract_diff imports matrix.net (rawPredict routing, key)
+rm -rf "${CTX}/scripts/matrix/__pycache__"
 cp -R "${REPO_ROOT}/fixtures/bbox" "${CTX}/fixtures/"
 cp "${REPO_ROOT}/deploy/probe/Dockerfile" "${CTX}/Dockerfile"
 gcloud builds submit "${CTX}" --project="${PROJECT}" --tag="${IMAGE}" --suppress-logs --quiet
@@ -88,15 +92,23 @@ if gcloud secrets describe "${SERVER_KEY_SECRET}" --project "${PROJECT}" >/dev/n
   JOB_SECRET_FLAGS=(--set-secrets="DGEM_SERVER_KEY=${SERVER_KEY_SECRET}:latest")
 fi
 
-deploy_job() {  # name targets task-timeout
-  local job="$1" targets="$2" timeout="$3"
+# Private (PSC) Vertex endpoint: PROBE_VERTEX_URL is http://<ID>-<REGION>-<NUM>.prediction.p.vertexai.goog/...:rawPredict,
+# reachable only from the VPC. PROBE_NETWORK=<vpc> (PROBE_SUBNET defaults to the same name) gives the hourly job
+# Direct VPC egress; private-ranges-only keeps the gateway and Google APIs on the normal path.
+NET_FLAGS=()
+if [[ -n "${PROBE_NETWORK:-}" ]]; then
+  NET_FLAGS=(--network="${PROBE_NETWORK}" --subnet="${PROBE_SUBNET:-${PROBE_NETWORK}}" --vpc-egress=private-ranges-only)
+fi
+
+deploy_job() {  # name targets task-timeout [extra gcloud flags...]
+  local job="$1" targets="$2" timeout="$3"; shift 3
   local extra="PROBE_LATENCY_REQUESTS=${N}"
   [[ -n "${PROBE_GATEWAY_AUDIENCE:-}" ]] && extra="${extra}|PROBE_GATEWAY_AUDIENCE=${PROBE_GATEWAY_AUDIENCE}"
   echo "==> Cloud Run job ${job} (${targets%%=*}...)"
   gcloud run jobs deploy "${job}" --project="${PROJECT}" --region="${REGION}" --image="${IMAGE}" \
     --service-account="${SA}" --tasks=1 --max-retries=0 --task-timeout="${timeout}" --cpu=1 --memory=512Mi \
     --set-env-vars="^|^PROBE_TARGETS=${targets}|${extra}" \
-    ${JOB_SECRET_FLAGS[@]+"${JOB_SECRET_FLAGS[@]}"} --quiet >/dev/null
+    ${JOB_SECRET_FLAGS[@]+"${JOB_SECRET_FLAGS[@]}"} "$@" --quiet >/dev/null
   # Scheduler calls the Run Admin API as the probe SA (needs run.jobs.run on the job).
   gcloud run jobs add-iam-policy-binding "${job}" --project="${PROJECT}" --region="${REGION}" \
     --member="serviceAccount:${SA}" --role="roles/run.invoker" --quiet >/dev/null
@@ -115,7 +127,8 @@ schedule() {  # scheduler-name job cron
   echo "    scheduled ${name}: '${cron}' (${SCHEDULE_TZ})"
 }
 
-deploy_job dgem-probe-hourly "vertex=${PROBE_VERTEX_URL},gateway=${PROBE_GATEWAY_URL}" 600s
+deploy_job dgem-probe-hourly "vertex=${PROBE_VERTEX_URL},gateway=${PROBE_GATEWAY_URL}" 600s \
+  ${NET_FLAGS[@]+"${NET_FLAGS[@]}"}
 schedule dgem-probe-hourly dgem-probe-hourly "${HOURLY_SCHEDULE}"
 if [[ "${PROBE_DAILY:-on}" != "off" && -n "${PROBE_CLOUDRUN_URL}" ]]; then
   # Long timeout: the first request waits for the scale-to-zero service to wake (~2.5 min).

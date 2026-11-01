@@ -17,6 +17,7 @@ package cmd
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/GoogleCloudPlatform/dgem/pkg/client"
@@ -46,5 +47,40 @@ func TestDecideUpstreamStatus(t *testing.T) {
 		if got := isColdStartRetryable(tc.err); got != tc.retry {
 			t.Errorf("%s: retryable %v, want %v", tc.name, got, tc.retry)
 		}
+	}
+}
+
+func TestSystemOneRawCallerAndForwardBody(t *testing.T) {
+	old := systemOneRawUsers
+	defer func() { systemOneRawUsers = old }()
+	systemOneRawUsers = []string{"client-sa@example.iam.gserviceaccount.com"}
+	if !systemOneRawCaller("Client-SA@example.iam.gserviceaccount.com") || systemOneRawCaller("other@example.com") || systemOneRawCaller("") {
+		t.Error("caller list match")
+	}
+	systemOneRawUsers = []string{"*"}
+	if !systemOneRawCaller("anyone@example.com") {
+		t.Error("* should match")
+	}
+	systemOneRawUsers = nil
+	if systemOneRawCaller("client-sa@example.iam.gserviceaccount.com") {
+		t.Error("empty list must match nobody")
+	}
+
+	plain := []byte(`{"state": "board\nrow 2", "questions": {"q": {"type": "noul"}}}`)
+	req, _, err := decodeSystemOneAdapterRequest(plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := systemOneForwardBody(plain, req); err != nil || string(got) != string(plain) {
+		t.Errorf("body without media must be forwarded byte for byte: %q %v", got, err)
+	}
+	withMedia := []byte(`{"state": "s", "questions": {"q": {"type": "noul"}}, "media": [{"mime_type": "image/png", "data": "AAAA", "name": "f.png"}]}`)
+	req, _, err = decodeSystemOneAdapterRequest(withMedia)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := systemOneForwardBody(withMedia, req)
+	if err != nil || strings.Contains(string(got), `"media"`) || !strings.Contains(string(got), `"images":["data:image/png;base64,AAAA"]`) {
+		t.Errorf("media not converted: %s %v", got, err)
 	}
 }

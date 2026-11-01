@@ -93,6 +93,8 @@ def is_vertex(url):
     host = (urllib.parse.urlparse(url).hostname or "").lower()
     if host == "prediction.vertexai.goog" or host.endswith(".prediction.vertexai.goog"):
         return True
+    if host == "prediction.p.vertexai.goog" or host.endswith(".prediction.p.vertexai.goog"):
+        return True
     if host == "aiplatform.googleapis.com" or host.endswith(".aiplatform.googleapis.com"):
         return True
     if host.endswith(".googleapis.com"):

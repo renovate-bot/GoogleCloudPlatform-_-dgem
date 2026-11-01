@@ -81,6 +81,43 @@ def _run(tmp, cand_acc, cand_flip):
         return R.build(tmp, json.load(f))
 
 
+class TestRawPredictRouting(unittest.TestCase):
+    """A Vertex :rawPredict base (private/PSC endpoint) sends every call to its one route; health becomes a POST."""
+
+    def test_routes(self):
+        from matrix import net
+        rp = "https://123.us-central1-456.prediction.vertexai.goog/v1/projects/456/locations/us-central1/endpoints/123:rawPredict"
+        self.assertEqual(net.route(rp, "/v1/systemone", {"q": 1}), (rp, {"q": 1}, None))
+        self.assertEqual(net.route(rp, "/health", None, "GET"), (rp, {"health": True}, "POST"))
+        self.assertEqual(net.route(rp, "/health"), (rp, {"health": True}, "POST"))
+        psc = "http://123-us-central1-456.prediction.p.vertexai.goog/v1/projects/456/locations/us-central1/endpoints/123:rawPredict"
+        self.assertTrue(net.is_vertex(psc))
+        orig_mint, minted = net._mint, []
+        net._mint = lambda kind, aud: minted.append(kind) or "tok"
+        net._CACHE.clear()
+        try:
+            self.assertEqual(net.token_for(psc), "tok")          # http, but PSC: access token
+            self.assertIsNone(net.token_for("http://127.0.0.1:8080/v1"))  # other http: none
+        finally:
+            net._mint = orig_mint
+            net._CACHE.clear()
+        self.assertEqual(minted, ["access"])
+        self.assertEqual(net.route(psc, "/health"), (psc, {"health": True}, "POST"))
+        inv = "https://x.run.app"
+        self.assertEqual(net.route(inv, "/health"), (inv + "/health", None, None))
+        sent = []
+        orig = net.request
+        net.request = lambda url, body=None, **kw: sent.append((url, body, kw.get("method"))) or (200, {}, 1.0, {})
+        try:
+            t = Target("priv", rp)
+            t.systemone({"questions": {}})
+            t.health()
+        finally:
+            net.request = orig
+        self.assertEqual(sent[0][0], rp)
+        self.assertEqual(sent[1], (rp, {"health": True}, "POST"))
+
+
 class TestServerKey(unittest.TestCase):
     """X-DGem-Key (the serving image's service key) is sent on every target request when DGEM_SERVER_KEY is set: the
     first entry of a rotation list, and no header at all when it is unset."""

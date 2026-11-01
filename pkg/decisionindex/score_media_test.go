@@ -366,3 +366,53 @@ func TestMediaAlias(t *testing.T) {
 		t.Errorf("audio request reached upstream (%d reads)", n)
 	}
 }
+
+// Requests the serving image can answer as sent may be forwarded unchanged; the rest need the adapter.
+func TestFitsServingImage(t *testing.T) {
+	q := func(js string) SystemOneQuestion {
+		var x SystemOneQuestion
+		if err := json.Unmarshal([]byte(js), &x); err != nil {
+			t.Fatal(err)
+		}
+		return x
+	}
+	choice := q(`{"type": "choice", "criteria": {"a": "", "b": "", "c": ""}}`)
+	score := q(`{"type": "score", "criteria": ["low", "mid", "high", "max"]}`)
+	noul := q(`{"type": "noul"}`)
+	smallTurn := SystemOneRequest{State: "board", Questions: map[string]SystemOneQuestion{"rotation": choice, "column": choice, "hold": noul, "risk": score}}
+	if !FitsServingImage(smallTurn) {
+		t.Error("4-question turn with a score should fit")
+	}
+	nine := SystemOneRequest{Questions: map[string]SystemOneQuestion{}}
+	for i := 0; i < 9; i++ {
+		nine.Questions[fmt.Sprintf("q%d", i)] = noul
+	}
+	wide := map[string]string{}
+	for i := 0; i < 27; i++ {
+		wide[fmt.Sprintf("o%02d", i)] = ""
+	}
+	for name, r := range map[string]SystemOneRequest{
+		"9 questions":     nine,
+		"27 options":      {Questions: map[string]SystemOneQuestion{"q": {Type: "choice", Criteria: wide}}},
+		"1 option":        {Questions: map[string]SystemOneQuestion{"q": q(`{"type": "choice", "criteria": {"only": ""}}`)}},
+		"27 levels":       {Questions: map[string]SystemOneQuestion{"q": {Type: "score", Levels: distinctLevels(27)}}},
+		"1 level":         {Questions: map[string]SystemOneQuestion{"q": q(`{"type": "score", "criteria": ["only"]}`)}},
+		"empty type":      {Questions: map[string]SystemOneQuestion{"q": q(`{"criteria": {"a": "", "b": ""}}`)}},
+		"boolean synonym": {Questions: map[string]SystemOneQuestion{"q": q(`{"type": "boolean"}`)}},
+		"unmerged media":  {Questions: map[string]SystemOneQuestion{"q": noul}, Media: []SystemOneMedia{{MimeType: "image/png", Data: "AA"}}},
+		"no questions":    {},
+		"unknown type":    {Questions: map[string]SystemOneQuestion{"q": {Type: "ranking"}}},
+	} {
+		if FitsServingImage(r) {
+			t.Errorf("%s: should not fit", name)
+		}
+	}
+}
+
+func distinctLevels(n int) []string {
+	out := make([]string, n)
+	for i := range out {
+		out[i] = fmt.Sprintf("level %02d", i)
+	}
+	return out
+}

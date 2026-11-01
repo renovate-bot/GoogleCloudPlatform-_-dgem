@@ -1450,6 +1450,18 @@ def message_text(m):
     return c if isinstance(c, str) else ""
 
 
+def predict_kind(req, images):
+    """Which route a single-route (/predict) request means: "health", "systemone" or "chat"."""
+    if images:
+        return "systemone"  # only /v1/systemone takes multipart image uploads
+    if isinstance(req, dict):
+        if req.get("health") is True and len(req) == 1:
+            return "health"
+        if "messages" not in req and isinstance(req.get("questions"), dict):
+            return "systemone"
+    return "chat"
+
+
 class _Server(ThreadingHTTPServer):
     # dgem: the default listen backlog of 5 resets connections when a client opens as many at
     # once as the engine serves sequences (seen as Vertex "Model server early terminated the
@@ -1585,8 +1597,18 @@ class Handler(BaseHTTPRequestHandler):
             )
         if self.path == "/v1/systemone":
             return self._systemone(req, images)
-        # dgem: /predict and /rawPredict keep regional Vertex :rawPredict callers working.
-        if self.path in ("/v1/chat/completions", "/predict", "/rawPredict"):
+        if self.path == "/v1/chat/completions":
+            return self._chat(req)
+        # dgem: one route for every request, for Vertex :rawPredict (a private/PSC endpoint forwards every call to the
+        # model's single predictRoute; invoke routes are unavailable there). Dispatch on the body: {"health": true}
+        # answers /health, a systemone body (questions map, or a multipart upload) goes to /v1/systemone, anything else
+        # (chat messages) to /v1/chat/completions, as before.
+        if self.path in ("/predict", "/rawPredict"):
+            kind = predict_kind(req, images)
+            if kind == "health":
+                return self._json(200, _health_info())
+            if kind == "systemone":
+                return self._systemone(req, images)
             return self._chat(req)
         return self._json(404, {"error": {"message": "unknown route"}})
 

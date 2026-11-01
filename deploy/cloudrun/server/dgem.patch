@@ -538,10 +538,22 @@
      if q["type"] == "choice":
          return {
              "type": "choice",
-@@ -1201,21 +1450,44 @@
+@@ -1201,21 +1450,56 @@
      return c if isinstance(c, str) else ""
  
  
++def predict_kind(req, images):
++    """Which route a single-route (/predict) request means: "health", "systemone" or "chat"."""
++    if images:
++        return "systemone"  # only /v1/systemone takes multipart image uploads
++    if isinstance(req, dict):
++        if req.get("health") is True and len(req) == 1:
++            return "health"
++        if "messages" not in req and isinstance(req.get("questions"), dict):
++            return "systemone"
++    return "chat"
++
++
 +class _Server(ThreadingHTTPServer):
 +    # dgem: the default listen backlog of 5 resets connections when a client opens as many at
 +    # once as the engine serves sequences (seen as Vertex "Model server early terminated the
@@ -587,7 +599,7 @@
          return self._json(404, {"error": {"message": "unknown route"}})
  
      def _read_request(self):
-@@ -1249,8 +1521,33 @@
+@@ -1249,8 +1533,33 @@
              )
          return body, images
  
@@ -621,7 +633,7 @@
              return self._json(
                  401,
                  {
-@@ -1260,8 +1557,20 @@
+@@ -1260,8 +1569,20 @@
                      }
                  },
              )
@@ -643,14 +655,21 @@
          try:
              req, images = self._read_request()
          except Exception as e:
-@@ -1276,53 +1585,41 @@
-             )
-         if self.path == "/v1/systemone":
+@@ -1278,51 +1599,49 @@
              return self._systemone(req, images)
--        if self.path == "/v1/chat/completions":
-+        # dgem: /predict and /rawPredict keep regional Vertex :rawPredict callers working.
-+        if self.path in ("/v1/chat/completions", "/predict", "/rawPredict"):
+         if self.path == "/v1/chat/completions":
              return self._chat(req)
++        # dgem: one route for every request, for Vertex :rawPredict (a private/PSC endpoint forwards every call to the
++        # model's single predictRoute; invoke routes are unavailable there). Dispatch on the body: {"health": true}
++        # answers /health, a systemone body (questions map, or a multipart upload) goes to /v1/systemone, anything else
++        # (chat messages) to /v1/chat/completions, as before.
++        if self.path in ("/predict", "/rawPredict"):
++            kind = predict_kind(req, images)
++            if kind == "health":
++                return self._json(200, _health_info())
++            if kind == "systemone":
++                return self._systemone(req, images)
++            return self._chat(req)
          return self._json(404, {"error": {"message": "unknown route"}})
  
 -    def _raw_chat(self):
@@ -715,7 +734,7 @@
          except SchemaError as e:
              return self._json(
                  422, {"error": {"message": str(e), "type": "validation_error"}}
-@@ -1362,6 +1659,7 @@
+@@ -1362,6 +1681,7 @@
                  },
                  "diagnostics": body["diagnostics"],
              },
@@ -723,7 +742,7 @@
          )
  
      def _chat(self, req):
-@@ -1387,6 +1685,7 @@
+@@ -1387,6 +1707,7 @@
              schema_value = json.loads(message_text(msgs[0]))
              schema = parse_schema(schema_value)
              content = msgs[1].get("content", "")
@@ -731,7 +750,7 @@
              has_image = isinstance(content, list) and any(
                  isinstance(p, dict) and p.get("type") in ("image_url", "image")
                  for p in content
-@@ -1451,9 +1750,18 @@
+@@ -1451,9 +1772,18 @@
                      "total_tokens": completion_tokens,
                  },
              },
@@ -750,7 +769,7 @@
  def self_signed(cert_dir):
      """Paths of a self-signed certificate and key in cert_dir, made with
      openssl on first use."""
-@@ -1486,15 +1794,25 @@
+@@ -1486,15 +1816,25 @@
  def serve_tls(host, port, cert_dir):
      cert, key = self_signed(cert_dir)
      ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -778,7 +797,7 @@
      p = argparse.ArgumentParser()
      p.add_argument("--upstream", default="http://127.0.0.1:8010")
      p.add_argument("--model", default="dgemma")
-@@ -1507,6 +1825,12 @@
+@@ -1507,6 +1847,12 @@
          help="request widths round up to a multiple of this",
      )
      p.add_argument(
@@ -791,7 +810,7 @@
          "--no-constrained",
          dest="constrained",
          action="store_false",
-@@ -1523,6 +1847,7 @@
+@@ -1523,6 +1869,7 @@
          help="directory for the self-signed certificate",
      )
      ARGS = p.parse_args()
@@ -799,7 +818,7 @@
      CANVAS_LEN = ARGS.canvas
      CANVAS_STEP = ARGS.canvas_step
      init_tokenizer(AutoTokenizer.from_pretrained(ARGS.tokenizer))
-@@ -1537,7 +1862,8 @@
+@@ -1537,7 +1884,8 @@
          f"(canvas {CANVAS_LEN})",
          flush=True,
      )

@@ -41,6 +41,11 @@ class Target:
         if self.base.endswith("/v1"):
             self.base = self.base[:-3]
 
+    def _req(self, path, body=None, **kw):
+        """net.request on a serving-image path; a Vertex :rawPredict base sends every call to its one route."""
+        url, body, method = net.route(self.base, path, body, kw.pop("method", None))
+        return net.request(url, body, method=method, **kw)
+
     @property
     def kind(self):
         if net.is_vertex(self.base):
@@ -55,24 +60,24 @@ class Target:
         return self.base if self.kind == "vertex" else self.base + "/v1"
 
     def health(self):
-        st, body, _, _ = net.request(self.base + "/health", timeout=60, retries=1)
+        st, body, _, _ = self._req("/health", timeout=60, retries=1, headers=net.server_key_header())
         return st, body
 
     def systemone(self, body, timeout=300):
-        return net.request(self.base + "/v1/systemone", {**body, **self.options}, timeout=timeout,
-                           headers=net.server_key_header())
+        return self._req("/v1/systemone", {**body, **self.options}, timeout=timeout,
+                         headers=net.server_key_header())
 
     def chat(self, schema, state, timeout=300):
         payload = {"model": "dgemma", "messages": [{"role": "system", "content": json.dumps({**schema, **self.options})},
                                                    {"role": "user", "content": json.dumps(state, ensure_ascii=False)}],
                    "logprobs": True, "top_logprobs": 5}
-        return net.request(self.base + "/v1/chat/completions", payload, timeout=timeout,
-                           headers=net.server_key_header())
+        return self._req("/v1/chat/completions", payload, timeout=timeout,
+                         headers=net.server_key_header())
 
     # scripts/contract_diff.py calls t.request(path, body, method) -> (status, raw bytes, headers)
     def request(self, path, body=None, method="POST"):
-        st, b, _, h = net.request(self.base + path, body, method=method, retries=0, raw=True,
-                                  headers=net.server_key_header())
+        st, b, _, h = self._req(path, body, method=method, retries=0, raw=True,
+                                headers=net.server_key_header())
         if isinstance(b, dict):  # network error
             b = json.dumps(b).encode()
         return st, b, h

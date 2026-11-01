@@ -33,6 +33,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
 import serving_speed as ss  # noqa: E402  (reuses auth, schemas and the test image)
+from matrix import net  # noqa: E402  (rawPredict routing, X-DGem-Key)
 import urllib.error  # noqa: E402
 import urllib.request  # noqa: E402
 
@@ -93,17 +94,18 @@ EXPECT["ml_el_noul"] = {"billing": "yes"}
 class Target:
     def __init__(self, name, base):
         self.name, self.base = name, base.rstrip("/")
-        self.vertex = "prediction.vertexai.goog" in base
+        self.vertex = net.is_vertex(base)  # dedicated, private (PSC) or regional endpoint: access token
 
     def token(self):
         at, it = ss.TOK.get()
         return at if self.vertex else it
 
     def request(self, path, body=None, method="POST"):
+        url, body, method = net.route(self.base, path, body, method)  # Vertex :rawPredict: one route
         data = body if isinstance(body, (bytes, type(None))) else json.dumps(body).encode()
-        req = urllib.request.Request(self.base + path, data=data, method=method,
+        req = urllib.request.Request(url, data=data, method=method,
                                      headers={"Content-Type": "application/json", "Authorization": f"Bearer {self.token()}",
-                                              **ss.server_key_header()})
+                                              **net.server_key_header()})
         try:
             with urllib.request.urlopen(req, timeout=300) as r:
                 return r.status, r.read(), dict(r.headers)

@@ -6,6 +6,14 @@ image for a release in your own project with `make cloudrun-build`.
 
 ## Unreleased
 
+- **`/v1/systemone`: per-caller pass-through for requests the serving image can answer as sent.**
+  `--systemone-raw-users` / `DGEM_SYSTEMONE_RAW_USERS` (comma-separated verified identities, `*` for all; default
+  none) forwards a listed caller's adapter-mode request unchanged when it has at most 8 questions, every choice and
+  score has 2-26 options or levels, and types are literally `choice`/`noul`/`score` (`media` is converted to `images`).
+  Other requests still use the adapter. Why: the adapter builds a different prompt (a text state wrapped as JSON,
+  questions and options sorted, its own instructions) and response shape (no yes/no probabilities, sorted keys, no
+  `model`/`usage`) than the serving image, which changed a client's small-turn answers when score questions were added
+  to the adapter. The span log records `dgem.systemone.mode` (`passthrough` or `adapter`).
 - **Serving image: optional service key (`X-DGem-Key`).** With `DGEM_SERVER_KEY` set (comma-separated to rotate),
   every `POST` needs a matching `X-DGem-Key` header; `GET /health` stays open. Unlike `API_KEY` it works on Vertex AI
   and Cloud Run, where `Authorization` carries the Google token. The `dgem` CLI, the gateway, `dgem systemone serve`,

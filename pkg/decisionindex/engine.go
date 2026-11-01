@@ -415,7 +415,26 @@ type EvaluationTrace struct {
 	WideBracketedQs  int     `json:"wide_bracketed_questions"`
 	MultiSlotBatches int     `json:"multi_slot_batches"`
 	WallTimeMs       float64 `json:"wall_time_ms"`
+	// ServerMs is the serving image's own time for this request: the sum of diagnostics.timing.total_ms over every
+	// pass the adapter made (batches, bracket rounds). Omitted when the server reports no timing.
+	ServerMs         float64 `json:"server_ms,omitempty"`
 	TemperatureScale float64 `json:"temperature_scale,omitempty"`
+}
+
+// serverTime accumulates the upstream server time of one ExecuteSystemOne call across its passes.
+type serverTime struct {
+	mu sync.Mutex
+	ms float64
+}
+
+type serverTimeKey struct{}
+
+func addServerTime(ctx context.Context, ms float64) {
+	if st, ok := ctx.Value(serverTimeKey{}).(*serverTime); ok && st != nil && ms > 0 {
+		st.mu.Lock()
+		st.ms += ms
+		st.mu.Unlock()
+	}
 }
 
 // EngineOptions configures the Decision Index execution adapter.
@@ -546,6 +565,8 @@ func ExecuteSystemOne(ctx context.Context, cli *client.Client, req SystemOneRequ
 		return nil, err
 	}
 	stateText := FormatState(req.State)
+	st := &serverTime{}
+	ctx = context.WithValue(ctx, serverTimeKey{}, st)
 	answers := make(map[string]SystemOneAnswer, len(qKeys))
 	var mu sync.Mutex
 	totalPasses := 0
@@ -613,6 +634,7 @@ func ExecuteSystemOne(ctx context.Context, cli *client.Client, req SystemOneRequ
 			WideBracketedQs:  wideQs,
 			MultiSlotBatches: multiBatches,
 			WallTimeMs:       float64(time.Since(start).Milliseconds()),
+			ServerMs:         math.Round(st.ms*10) / 10,
 			TemperatureScale: opts.TemperatureScale,
 		},
 	}, nil
@@ -704,6 +726,7 @@ func evaluateStandardBatch(
 	if err != nil {
 		return nil, 1, err
 	}
+	addServerTime(ctx, resp.Diagnostics.Timing.TotalMs)
 
 	if (opts.DualMirror && len(batchKeys) <= 4) || opts.NullPriorDebias {
 		permutation.PostProcessDecisionResponse(resp, slotOpts, opts.DualMirror && len(batchKeys) <= 4, opts.NullPriorDebias, opts.PriorAlpha)
@@ -1369,4 +1392,40 @@ func catchAllKeys(criteria map[string]string) []string {
 		return nil
 	}
 	return out
+}
+
+// FitsServingImage reports whether the serving image's own /v1/systemone can answer req in one read exactly as sent:
+// at most MaxSlotsPerPass questions (the server keeps its readable "lines" answer format up to 10), every choice with
+// 2..MaxOptionsPerSlot options and every score with 2..MaxOptionsPerSlot levels, and only known question types.
+// Requests that fit can be forwarded unchanged; the rest need the adapter (batching, brackets, one-option answers).
+// Call after MergeMedia.
+func FitsServingImage(req SystemOneRequest) bool {
+	if len(req.Questions) == 0 || len(req.Questions) > MaxSlotsPerPass || len(req.Media) > 0 {
+		return false
+	}
+	for k, q := range req.Questions {
+		kind, err := questionKind(k, q)
+		if err != nil {
+			return false
+		}
+		switch kind {
+		case kindChoice:
+			if len(q.Criteria) < 2 || len(q.Criteria) > MaxOptionsPerSlot {
+				return false
+			}
+		case kindScore:
+			if len(q.Levels) < 2 || len(q.Levels) > MaxOptionsPerSlot {
+				return false
+			}
+		case kindNoul:
+		default:
+			return false
+		}
+		// The serving image's Jev parser takes "type" literally (noul, choice, score): an empty type or a synonym
+		// (bool, boolean) is resolved only here.
+		if q.Type != kind {
+			return false
+		}
+	}
+	return true
 }

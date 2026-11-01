@@ -402,7 +402,9 @@ def _summ(recs, elapsed=None):
     w = [r["wall_ms"] for r in ok]
     s = [r.get("server_ms") for r in ok]
     out = {"n": len(recs), "ok": len(ok), "errors": len(recs) - len(ok), "wall_p50": _pct(w, 50),
-           "wall_p90": _pct(w, 90), "wall_p99": _pct(w, 99), "server_p50": _pct(s, 50)}
+           "wall_p90": _pct(w, 90), "wall_p95": _pct(w, 95), "wall_p99": _pct(w, 99), "server_p50": _pct(s, 50),
+           "server_p90": _pct(s, 90), "server_p95": _pct(s, 95), "server_p99": _pct(s, 99),
+           "server_n": sum(1 for x in s if x is not None)}
     if elapsed:
         out["rps"] = len(ok) / elapsed
     errs = [r.get("error") for r in recs if r["status"] != 200][:3]

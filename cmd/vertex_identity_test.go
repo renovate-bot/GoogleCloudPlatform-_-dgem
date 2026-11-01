@@ -122,3 +122,39 @@ func TestExtractEndpointIDNoSubstringMatch(t *testing.T) {
 		t.Errorf("query smuggling: %q", got)
 	}
 }
+
+func TestVertexIdentityPrivatePSC(t *testing.T) {
+	const pscPath = "/v1/projects/222/locations/us-central1/endpoints/111:rawPredict"
+	const pscHost = "111-us-central1-222.prediction.p.vertexai.goog"
+	for _, u := range []string{"http://" + pscHost + pscPath, "https://" + pscHost + pscPath, "http://" + pscHost + ":80" + pscPath} {
+		got, err := parseVertexEndpointIdentity(u)
+		if err != nil || !got.Private || got.EndpointID != "111" || got.ProjectNum != "222" {
+			t.Errorf("%s: got %+v %v", u, got, err)
+		}
+	}
+	for _, bad := range []string{
+		"http://111-us-central1-999.prediction.p.vertexai.goog" + pscPath, // host project differs from the path
+		"http://999-us-central1-222.prediction.p.vertexai.goog" + pscPath, // host ID differs
+		"http://111-europe-west4-222.prediction.p.vertexai.goog" + pscPath,
+		"http://x.111-us-central1-222.prediction.p.vertexai.goog" + pscPath,
+		"http://" + pscHost + ":8080" + pscPath,
+		"https://" + pscHost + ":80" + pscPath,
+		"http://" + pscHost + pscPath + "?x=/endpoints/111",
+		"http://" + pscHost + "/v1/projects/222/locations/us-central1/endpoints/111/invoke/v1/chat/completions",
+	} {
+		if got, err := parseVertexEndpointIdentity(bad); err == nil {
+			t.Errorf("%s: expected rejection, got %+v", bad, got)
+		}
+	}
+
+	// A PSC endpoint configured on the gateway allows itself, not another project's PSC endpoint with the same ID.
+	cfg := "http://" + pscHost + pscPath
+	withBackendConfig(t, cfg, testCR, "", false, "cloudrun", nil, nil)
+	if err := checkVertexOverride(cfg, cfg); err != nil {
+		t.Fatalf("configured PSC endpoint rejected: %v", err)
+	}
+	foreign := "http://111-us-central1-999.prediction.p.vertexai.goog/v1/projects/999/locations/us-central1/endpoints/111:rawPredict"
+	if err := checkVertexOverride(foreign, cfg); err == nil {
+		t.Fatal("foreign PSC endpoint with the same ID accepted")
+	}
+}

@@ -106,6 +106,7 @@ func init() {
 	serveCmd.Flags().BoolVar(&serveLocalMode, "local", false, "Run gateway targeting local diffgemma (Apple Silicon Metal) without cloud failover (env: DGEM_SERVE_LOCAL)")
 	serveCmd.Flags().StringVar(&serveCascadeModel, "cascade-model", DefaultCascadeGeminiModel, "Default Stage-2 Vertex AI Gemini 3.x model for cascade escalation (e.g. 'gemini-3.8-flash', 'gemini-3.5-flash-lite'; env: DGEM_CASCADE_MODEL)")
 	serveCmd.Flags().StringVar(&serveCascadeModels, "cascade-models", DefaultCascadeGeminiModels, "Comma-separated list of selectable Stage-2 Vertex AI Gemini 3.x models exposed in the API & Web Studio (env: DGEM_CASCADE_MODELS)")
+	serveCmd.Flags().StringSliceVar(&systemOneRawUsers, "systemone-raw-users", nil, "Callers (verified identity, e.g. a service account email; '*' for all) whose /v1/systemone requests are forwarded to the serving image unchanged when it can answer them as sent (<=8 questions, 2-26 options or levels); other requests use the adapter (env: DGEM_SYSTEMONE_RAW_USERS)")
 	serveCmd.Flags().StringVar(&serveSystemOneMode, "systemone-mode", "adapter", "Serving mode for POST /v1/systemone: 'adapter' (applies wide-option bracket tournaments & multi-slot canvas batching, default) or 'passthrough'")
 	serveCmd.Flags().Float64Var(&serveSystemOneTemp, "systemone-temperature", 1.0, "Post-hoc slot logit temperature scaling factor T* for /v1/systemone (default 1.0)")
 
@@ -456,8 +457,19 @@ func expandAndValidateVertexURL(raw string) (string, error) {
 	if parsed != nil {
 		hostLower = strings.ToLower(parsed.Host)
 	}
+	// A private (PSC) endpoint, <ID>-<REGION>-<PROJECT_NUMBER>.prediction.p.vertexai.goog, is reachable only inside the
+	// VPC and serves a self-signed certificate on 443, so http (port 80) is accepted for it, and only for its single
+	// :rawPredict route. Every other host must use https.
+	if err == nil && client.IsPrivateVertexHost(parsed.Hostname()) {
+		lp := strings.ToLower(parsed.Path)
+		if (parsed.Scheme == "http" || parsed.Scheme == "https") &&
+			(strings.HasSuffix(lp, ":rawpredict") || strings.HasSuffix(lp, ":predict")) && strings.Contains(lp, "/endpoints/") {
+			return v, nil
+		}
+		return "", fmt.Errorf("invalid private Vertex endpoint URL (must be http(s)://<host>%s/v1/projects/.../locations/.../endpoints/<ID>:rawPredict): %s", client.PrivateVertexHostSuffix, raw)
+	}
 	if err != nil || parsed.Scheme != "https" || (!strings.HasSuffix(hostLower, dedicatedVertexSuffix) && !strings.HasSuffix(hostLower, regionalVertexSuffix) && hostLower != globalVertexHost) {
-		return "", fmt.Errorf("invalid Vertex AI Endpoint URL (must target https://<endpoint>.<region>-<project_num>.prediction.vertexai.goog/.../invoke/... or https://<region>-aiplatform.googleapis.com/... or be an Endpoint ID): %s", raw)
+		return "", fmt.Errorf("invalid Vertex AI Endpoint URL (must target https://<endpoint>.<region>-<project_num>.prediction.vertexai.goog/.../invoke/..., https://<region>-aiplatform.googleapis.com/..., a private endpoint http(s)://...%s/...:rawPredict, or be an Endpoint ID): %s", client.PrivateVertexHostSuffix, raw)
 	}
 	norm := client.NormalizeVertexEndpointURL(v)
 	// The suffix check alone admits any project's dedicated endpoint and arbitrary paths; require a well-formed endpoint
@@ -637,10 +649,13 @@ func inspectVertexEndpointState(ctx context.Context, rawVertexURL string) vertex
 		return st
 	}
 
-	// 1. Fast Data-Plane Check (/invoke/health on Dedicated Endpoint DNS takes ~15ms when deployed)
+	// 1. Fast Data-Plane Check (/invoke/health on Dedicated Endpoint DNS takes ~15ms when deployed). A :rawPredict
+	// endpoint (private/PSC, or regional) has no invoke routes, so its state comes from the control plane only.
 	healthURL := fmt.Sprintf("https://%s.%s-%s.prediction.vertexai.goog/v1/projects/%s/locations/%s/endpoints/%s/invoke/health", epID, region, projNum, proj, region, epID)
 	hCtx, hCancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
-	if hReq, err := http.NewRequestWithContext(hCtx, http.MethodGet, healthURL, nil); err == nil {
+	if strings.Contains(strings.ToLower(rawVertexURL), ":rawpredict") {
+		hCancel()
+	} else if hReq, err := http.NewRequestWithContext(hCtx, http.MethodGet, healthURL, nil); err == nil {
 		hReq.Header.Set("Authorization", "Bearer "+tok)
 		if hResp, err := http.DefaultClient.Do(hReq); err == nil {
 			hResp.Body.Close()
@@ -1084,6 +1099,14 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 	if envSOMode := os.Getenv("DGEM_SYSTEMONE_MODE"); envSOMode != "" && !cmd.Flags().Changed("systemone-mode") {
 		serveSystemOneMode = strings.ToLower(strings.TrimSpace(envSOMode))
+	}
+	if v := os.Getenv("DGEM_SYSTEMONE_RAW_USERS"); v != "" && !cmd.Flags().Changed("systemone-raw-users") {
+		systemOneRawUsers = nil
+		for _, u := range strings.Split(v, ",") {
+			if u = strings.TrimSpace(u); u != "" {
+				systemOneRawUsers = append(systemOneRawUsers, u)
+			}
+		}
 	}
 	if envSOTemp := os.Getenv("DGEM_SYSTEMONE_TEMP"); envSOTemp != "" && !cmd.Flags().Changed("systemone-temperature") {
 		if t, err := strconv.ParseFloat(envSOTemp, 64); err == nil && t > 0 {
@@ -2029,24 +2052,41 @@ func runServe(cmd *cobra.Command, args []string) error {
 				})
 				return
 			}
-			soOpts := decisionindex.DefaultEngineOptions()
-			soOpts.TemperatureScale = serveSystemOneTemp
-			cli := GetClientForURL(resolvedURL)
-			soResp, soErr := decisionindex.ExecuteSystemOne(ctx, cli, soReq, soOpts)
-			if soErr != nil {
-				status, msg := decisionindex.ErrorStatus(soErr)
-				failSpan(proxySpan, status, msg)
-				http.Error(w, msg, status)
+			// Listed callers get their request forwarded to the serving image unchanged when it can answer it as sent:
+			// the adapter builds a different prompt (state as JSON, sorted questions and options, its own instructions)
+			// and response shape, which changed a client's small-turn answers when score questions were added to the
+			// adapter. Requests that don't fit still use the adapter.
+			passThrough := systemOneRawCaller(callerEmail(r)) && decisionindex.FitsServingImage(soReq)
+			if passThrough {
+				if nb, err := systemOneForwardBody(bodyBytes, soReq); err == nil {
+					bodyBytes = nb
+				} else {
+					passThrough = false
+				}
+			}
+			if passThrough {
+				proxySpan.SetAttributes(attribute.String("dgem.systemone.mode", "passthrough"))
+			} else {
+				proxySpan.SetAttributes(attribute.String("dgem.systemone.mode", "adapter"))
+				soOpts := decisionindex.DefaultEngineOptions()
+				soOpts.TemperatureScale = serveSystemOneTemp
+				cli := GetClientForURL(resolvedURL)
+				soResp, soErr := decisionindex.ExecuteSystemOne(ctx, cli, soReq, soOpts)
+				if soErr != nil {
+					status, msg := decisionindex.ErrorStatus(soErr)
+					failSpan(proxySpan, status, msg)
+					http.Error(w, msg, status)
+					return
+				}
+				if soResp.EvaluationTrace != nil {
+					proxySpan.SetAttributes(attribute.Int("dgem.systemone.forward_passes", soResp.EvaluationTrace.ForwardPasses))
+				}
+				proxySpan.SetAttributes(attribute.Int("http.status_code", http.StatusOK))
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("X-DGem-Backend-Used", backendTarget)
+				_ = json.NewEncoder(w).Encode(soResp)
 				return
 			}
-			if soResp.EvaluationTrace != nil {
-				proxySpan.SetAttributes(attribute.Int("dgem.systemone.forward_passes", soResp.EvaluationTrace.ForwardPasses))
-			}
-			proxySpan.SetAttributes(attribute.Int("http.status_code", http.StatusOK))
-			w.Header().Set("Content-Type", "application/json")
-			w.Header().Set("X-DGem-Backend-Used", backendTarget)
-			_ = json.NewEncoder(w).Encode(soResp)
-			return
 		}
 
 		if reqPath == "/v1/systemone" && backendTarget == "local" {
@@ -2228,6 +2268,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 	fmt.Printf("   • Studio Assets:       %s\n", uiSource)
 	if len(corsOrigins) > 0 {
 		fmt.Printf("   • CORS Origins:        %s\n", strings.Join(corsOrigins, ", "))
+	}
+	if len(systemOneRawUsers) > 0 {
+		fmt.Printf("   • SystemOne raw:       %s (forwarded unchanged when the serving image can answer as sent)\n", strings.Join(systemOneRawUsers, ", "))
 	}
 	switch {
 	case blc.on():

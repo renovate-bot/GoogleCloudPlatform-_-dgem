@@ -125,6 +125,30 @@ Rollback while both are deployed is instant (move the split back); after undeplo
 resource (~15 minutes). Before step 2 on a new serving image, run the comparison in
 [Promote a new serving image](/dgem/operate/runbook/#promote-a-new-serving-image).
 
+## Private endpoint (Private Service Connect)
+
+A dedicated **private** (PSC) endpoint has no invoke routes, so `/invoke/*` is unavailable there. Upload the model with
+a single route instead and call it with `:rawPredict`:
+
+```bash
+ROUTE_MODE=predict ./scripts/deploy_vertex_endpoint.sh   # predictRoute /predict, healthRoute /health
+```
+
+- Callers inside the VPC use the private host:
+  `http://<ENDPOINT_ID>-<REGION>-<PROJECT_NUMBER>.prediction.p.vertexai.goog/v1/projects/<PROJECT_NUMBER>/locations/<REGION>/endpoints/<ENDPOINT_ID>:rawPredict`
+  (resolved through your private DNS zone). Use plain **http on port 80**: port 443 serves a self-signed certificate,
+  and the traffic stays inside the VPC. Vertex still enforces IAM there, so send an OAuth access token (dgem mints one
+  for these hosts, as for dedicated endpoints) plus `X-DGem-Key` if the server uses one.
+- `dgem` (`-u`, `--vertex-url`, `DGEM_VERTEX_URL`) keeps the `:rawPredict` URL as given and the gateway sends both
+  `/v1/chat/completions` and `/v1/systemone` traffic to it. http is accepted only for `*.prediction.p.vertexai.goog`
+  hosts with a `:rawPredict` path; every other Vertex URL must be https.
+- The serving image's single route dispatches on the body: chat `messages` → decisions, a `questions` map or a
+  multipart upload → `/v1/systemone`, `{"health": true}` → the health report (send `X-DGem-Key` if the server uses one).
+- The gateway reads the endpoint's state from the Vertex control plane (no data-plane health route through PSC).
+- Creating the PSC endpoint itself (allowlisted projects, forwarding rule, private DNS, Direct VPC egress for the
+  gateway) follows the
+  [Private Service Connect guide](https://cloud.google.com/vertex-ai/docs/predictions/private-service-connect).
+
 ## 6. Tear down
 
 ```bash

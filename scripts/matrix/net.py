@@ -43,6 +43,9 @@ def is_vertex(url):
     host = (urllib.parse.urlparse(url).hostname or "").lower()
     if host == "prediction.vertexai.goog" or host.endswith(".prediction.vertexai.goog"):
         return True
+    # .prediction.p.vertexai.goog = private (PSC) endpoint, reached over http on port 80 inside the VPC
+    if host == "prediction.p.vertexai.goog" or host.endswith(".prediction.p.vertexai.goog"):
+        return True
     if host == "aiplatform.googleapis.com" or host.endswith(".aiplatform.googleapis.com"):
         return True
     if host.endswith(".googleapis.com"):
@@ -101,7 +104,10 @@ def token_for(url):
     if os.environ.get("DGEM_MATRIX_TOKEN"):
         return os.environ["DGEM_MATRIX_TOKEN"]
     p = urllib.parse.urlparse(url)
-    if p.scheme != "https":
+    host = (p.hostname or "").lower()
+    # plain http gets no token (local targets), except a private Vertex (PSC) endpoint, which is called over http on
+    # port 80 inside the VPC and still requires an access token
+    if p.scheme != "https" and not (host == "prediction.p.vertexai.goog" or host.endswith(".prediction.p.vertexai.goog")):
         return None
     kind = "access" if is_vertex(url) else "id"
     aud = f"{p.scheme}://{p.netloc}"
@@ -185,6 +191,22 @@ def _open(req, timeout):
     if req.full_url.startswith("https://"):
         return urllib.request.build_opener(_RedirectHandler(), _HTTPSHandler(timeout)).open(req, timeout=timeout)
     return urllib.request.build_opener(_RedirectHandler()).open(req, timeout=timeout)
+
+
+def is_rawpredict(base):
+    """A Vertex :rawPredict base (private/PSC or regional endpoint): every call goes to that one URL and the serving
+    image dispatches on the body."""
+    return base.rstrip("/").lower().endswith(":rawpredict")
+
+
+def route(base, path, body=None, method=None):
+    """-> (url, body, method) for a serving-image path. On a :rawPredict base, POSTs go to the base itself and
+    GET /health becomes POST {"health": true} (the single route answers it)."""
+    if not is_rawpredict(base):
+        return base.rstrip("/") + path, body, method
+    if path in ("/health", "/") and (method or ("POST" if body is not None else "GET")) == "GET":
+        return base, {"health": True}, "POST"
+    return base, body, method
 
 
 def server_key_header():

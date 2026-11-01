@@ -88,7 +88,7 @@ echo "==> Profile ${VERTEX_PROFILE}: ${MACHINE_TYPE} + ${ACCELERATOR_COUNT}x ${A
 echo "    Image: ${IMAGE_URI}"
 echo "    Endpoint display name: ${ENDPOINT_DISPLAY_NAME} (an existing endpoint with this name is reused)"
 
-echo "==> [1/4] Uploading Invoke-Enabled Model (${MODEL_DISPLAY_NAME}) with invokeRoutePrefix=\"/*\"..."
+echo "==> [1/4] Uploading model (${MODEL_DISPLAY_NAME}), routes: ${ROUTE_MODE:-invoke}..."
 # Service-to-service key for the serving image (X-DGem-Key; see docs/deploy/public-images.md). Held only by services
 # (gateway, matrix jobs, probes), never given to people. Skipped when the secret doesn't exist.
 SERVER_KEY_SECRET="${SERVER_KEY_SECRET:-dgem-server-key}"
@@ -105,13 +105,23 @@ else
   echo "==> WARNING: secret ${SERVER_KEY_SECRET} not found: the endpoint will accept POSTs without X-DGem-Key"
 fi
 
+# Routes: "invoke" (default) = arbitrary custom routes (invokeRoutePrefix "/*", dedicated public endpoints, callers
+# use /invoke/...). "predict" = one predictRoute for private (PSC) endpoints, which have no invoke routes: callers use
+# .../endpoints/<ID>:rawPredict and the serving image dispatches on the body (chat, systemone, {"health": true}).
+ROUTE_MODE="${ROUTE_MODE:-invoke}"
+case "${ROUTE_MODE}" in
+  invoke) ROUTE_SPEC='"invokeRoutePrefix": "/*"' ;;
+  predict) ROUTE_SPEC='"predictRoute": "/predict"' ;;
+  *) echo "ROUTE_MODE must be invoke or predict" >&2; exit 1 ;;
+esac
+
 UPLOAD_PAYLOAD=$(cat <<EOF
 {
   "model": {
     "displayName": "${MODEL_DISPLAY_NAME}",
     "containerSpec": {
       "imageUri": "${IMAGE_URI}",
-      "invokeRoutePrefix": "/*",
+      ${ROUTE_SPEC},
       "healthRoute": "/health",
       "ports": [
         { "containerPort": 8080 }

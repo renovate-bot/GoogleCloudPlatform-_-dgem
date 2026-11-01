@@ -187,11 +187,26 @@ func (c *Client) WithAuthToken(token string) *Client {
 	return c
 }
 
+// PrivateVertexHostSuffix is the host suffix of a Vertex private (Private Service Connect) endpoint, e.g.
+// <ID>-<REGION>-<PROJECT_NUMBER>.prediction.p.vertexai.goog. It resolves only inside the VPC (private DNS); port 443
+// serves a self-signed certificate, so callers inside the VPC may use plain http on port 80.
+const PrivateVertexHostSuffix = ".prediction.p.vertexai.goog"
+
+// IsPrivateVertexHost reports whether host (no scheme or port) is a Vertex private (PSC) endpoint host.
+func IsPrivateVertexHost(host string) bool {
+	h := strings.ToLower(strings.TrimSpace(host))
+	if i := strings.LastIndex(h, ":"); i != -1 && !strings.Contains(h[i:], "]") {
+		h = h[:i]
+	}
+	return strings.HasSuffix(h, PrivateVertexHostSuffix)
+}
+
 // IsVertexEndpointURL returns true if rawURL targets a Google Cloud Vertex AI Online Prediction Endpoint
 // (either a Dedicated Endpoint *.prediction.vertexai.goog with /invoke/* custom routes or *.aiplatform.googleapis.com).
 func IsVertexEndpointURL(rawURL string) bool {
 	u := strings.ToLower(strings.TrimSpace(rawURL))
 	return strings.Contains(u, "prediction.vertexai.goog") ||
+		strings.Contains(u, "prediction.p.vertexai.goog") ||
 		strings.Contains(u, "aiplatform.googleapis.com") ||
 		strings.Contains(u, "/invoke/") ||
 		strings.HasSuffix(u, "/invoke") ||
@@ -204,8 +219,15 @@ func IsVertexEndpointURL(rawURL string) bool {
 //   - For Dedicated Endpoints using arbitrary custom routes (invokeRoutePrefix="/*"),
 //     routes to .../invoke/v1/chat/completions (which Vertex forwards as /v1/chat/completions to structured_server.py).
 //   - For standard regional endpoints (aiplatform.googleapis.com without /invoke), routes to :rawPredict.
+//   - A URL that already ends in :rawPredict (regional, or a private/PSC dedicated endpoint) is kept unchanged.
 func NormalizeVertexEndpointURL(rawURL string) string {
 	u := strings.TrimRight(strings.TrimSpace(rawURL), "/")
+	// An explicit :rawPredict / :predict URL is kept as is, on any host: a private (PSC) dedicated endpoint shares the
+	// *.prediction.vertexai.goog name but has no invoke routes, so it must not be rewritten to /invoke/... The serving
+	// image's single route dispatches on the body (chat or systemone).
+	if lu := strings.ToLower(u); strings.HasSuffix(lu, ":rawpredict") || strings.HasSuffix(lu, ":streamrawpredict") || strings.HasSuffix(lu, ":predict") {
+		return u
+	}
 	if strings.Contains(strings.ToLower(u), "prediction.vertexai.goog") || strings.Contains(strings.ToLower(u), "/invoke") {
 		if strings.HasSuffix(u, "/invoke/v1/chat/completions") ||
 			strings.HasSuffix(u, "/invoke/v1/raw/chat/completions") ||
